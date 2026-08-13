@@ -1,17 +1,16 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { NextResponse } from 'next/server';
-import { construirAlertas, alertasComoTexto } from '../../../lib/alerts';
+import { buildAlerts, alertsToPrompt } from '../../../lib/alerts';
 
 /**
  * Chat clínico.
  *
- * Dos usos: consultar dudas médicas y pedir trabajo sobre el paciente
- * abierto —por ejemplo, redactar el reporte de la cita a partir de la
- * consulta grabada.
- *
- * SEGURIDAD: las alertas del expediente se calculan aquí, en el servidor,
- * y se anteponen a todo lo demás. Un modelo no puede advertir sobre lo
- * que no ve.
+ * SEGURIDAD CLÍNICA
+ * Las alertas del expediente se calculan en el servidor y se inyectan
+ * al inicio del contexto. No se deja que el modelo las deduzca leyendo
+ * campos de texto: un embarazo declarado o un anticoagulante cambian la
+ * respuesta correcta a casi cualquier pregunta de tratamiento, así que
+ * deben estar delante del modelo siempre.
  */
 
 export const maxDuration = 120;
@@ -23,69 +22,76 @@ function construirSystem(paciente, transcripcion) {
   const p = paciente || {};
 
   if (!p.name) {
-    return `Eres asistente clínico de Prime Advanced Dentistry, clínica de implantología y rehabilitación oral en Cancún.
+    return `Eres asistente clínico de Prime Advanced Dentistry, clínica de implantología y rehabilitación oral en Cancún. Asistes al Dr. Javier Paz y a su equipo.
 
-No hay ningún paciente abierto. Responde como consulta clínica general.
+No hay paciente abierto. Responde como consulta clínica general.
 
-Hablas con profesionales de la salud: sé directo y técnico. Cuando un punto sea controvertido o dependa del caso, dilo en lugar de dar una respuesta única. Si algo excede lo que puedes saber sin ver al paciente, reconócelo.
+Hablas con profesionales de la salud: sé directo y técnico. Cuando un punto sea controvertido o dependa del caso, dilo en lugar de dar una respuesta única. Si algo excede lo que puedes saber desde aquí, dilo con claridad.
 
-La decisión clínica es del profesional. Responde en español salvo que te escriban en otro idioma.`;
+La decisión clínica es del profesional. Tú aportas información y redacción.
+
+Responde en español, salvo que te escriban en otro idioma.`;
   }
 
-  const alertas = construirAlertas(p);
-  const rojas = alertas.filter(a => a.nivel === 'roja');
+  const alertas = alertsToPrompt(buildAlerts(p));
 
-  const expediente = [
-    `Nombre: ${p.name}${p.age ? ` · ${p.age} años` : ''}`,
-    `Expediente: ${p.record_number || '—'}`,
-    p.concern     ? `Motivo de consulta: ${p.concern}` : null,
-    p.allergies   ? `Alergias: ${p.allergies}` : 'Alergias: ninguna declarada',
-    p.conditions  ? `Padecimientos: ${p.conditions}` : 'Padecimientos: ninguno declarado',
-    p.meds        ? `Medicación: ${p.meds}` : 'Medicación: ninguna declarada',
-    p.surgeries   ? `Cirugías previas: ${p.surgeries}` : null,
-    p.pregnant    ? 'Embarazo: SÍ' : 'Embarazo: no',
-    p.smoke       ? `Tabaquismo: ${typeof p.smoke === 'string' ? p.smoke : 'sí'}` : 'Tabaquismo: no',
-    p.alcohol     ? `Alcohol: ${typeof p.alcohol === 'string' ? p.alcohol : 'sí'}` : null,
-    p.drugs       ? `Drogas recreativas: ${typeof p.drugs === 'string' ? p.drugs : 'sí'}` : null,
-    p.doctor_plan ? `Plan de tratamiento: ${p.doctor_plan}` : null,
-    p.doctor_obs  ? `Observaciones del doctor: ${p.doctor_obs}` : null
+  const historia = [
+    p.has_allergies  ? `Alergias: ${p.allergies || 'declaradas sin especificar'}` : 'Alergias: ninguna declarada',
+    p.has_conditions ? `Padecimientos: ${p.conditions || 'declarados sin especificar'}` : 'Padecimientos: ninguno declarado',
+    p.has_meds       ? `Medicación: ${p.meds || 'declarada sin especificar'}` : 'Medicación: ninguna declarada',
+    p.has_surgeries  ? `Cirugías previas: ${p.surgeries || 'declaradas sin especificar'}` : null,
+    p.pregnant       ? 'Embarazo o lactancia: SÍ' : null,
+    p.smoke          ? `Tabaquismo: ${typeof p.smoke === 'string' ? p.smoke : 'sí'}` : null,
+    p.alcohol        ? `Alcohol: ${typeof p.alcohol === 'string' ? p.alcohol : 'sí'}` : null,
+    p.drugs          ? `Drogas recreativas: ${typeof p.drugs === 'string' ? p.drugs : 'sí'}` : null
   ].filter(Boolean).join('\n');
-
-  const bloqueTranscripcion = transcripcion
-    ? `\n\nTRANSCRIPCIÓN DE LA CONSULTA GRABADA\n${transcripcion}`
-    : '';
-
-  const reglaAlertas = rojas.length ? `
-REGLA QUE NO ADMITE EXCEPCIÓN
-
-Este paciente tiene ${rojas.length === 1 ? 'una alerta crítica' : `${rojas.length} alertas críticas`}. Siempre que respondas sobre tratamiento, procedimientos, fármacos, anestesia o radiografías, debes mencionar explícitamente la alerta que aplique y su implicación clínica — aunque quien pregunta no la haya mencionado y aunque la pregunta parezca rutinaria.
-
-Quien consulta puede no tener el expediente presente. Tu función es que ese dato no se pase por alto.
-` : '';
 
   return `Eres asistente clínico de Prime Advanced Dentistry, clínica de implantología y rehabilitación oral en Cancún. Asistes al Dr. Javier Paz y a su equipo.
 
-╔══════════════════════════════════════════════════════════╗
-║  ALERTAS MÉDICAS DEL PACIENTE                            ║
-╚══════════════════════════════════════════════════════════╝
-${alertasComoTexto(alertas)}
-${reglaAlertas}
-EXPEDIENTE
-${expediente}${bloqueTranscripcion}
+=========================================================
+ALERTAS MÉDICAS DE ESTE PACIENTE
+=========================================================
+${alertas}
+=========================================================
 
+PACIENTE ABIERTO
+Nombre: ${p.name}${p.age ? ` · ${p.age} años` : ''}
+Expediente: ${p.record_number || '—'}
+${p.concern     ? `Motivo de consulta: ${p.concern}` : ''}
+${p.doctor_plan ? `Plan de tratamiento: ${p.doctor_plan}` : ''}
+${p.doctor_obs  ? `Observaciones del doctor: ${p.doctor_obs}` : ''}
+
+HISTORIA MÉDICA DECLARADA
+${historia}
+${transcripcion ? `\nTRANSCRIPCIÓN DE LA CONSULTA GRABADA\n${transcripcion}` : ''}
+
+=========================================================
 CÓMO TRABAJAS
+=========================================================
+
+SOBRE LAS ALERTAS — lo más importante de estas instrucciones
+
+Antes de responder cualquier pregunta sobre tratamiento, procedimientos, fármacos, anestesia o pronóstico, revisa las alertas de arriba y considera si alguna modifica tu respuesta.
+
+Si existe una alerta roja relevante, menciónala de forma destacada al inicio de tu respuesta, aunque no te hayan preguntado por ella. Un embarazo, un anticoagulante o un bifosfonato cambian la conducta correcta, y el profesional necesita tenerlo presente en ese momento, no después.
+
+No asumas que quien pregunta ya recordó la alerta. Tampoco la repitas mecánicamente en cada mensaje: menciónala cuando sea pertinente a lo que se discute.
+
+Si no hay alertas relevantes para la pregunta, responde con normalidad sin forzar advertencias.
+
+RESTO DEL CRITERIO
 
 Hablas con profesionales de la salud. Sé directo y técnico: no hace falta suavizar terminología ni agregar advertencias generales que un odontólogo ya conoce.
 
-Cuando te pidan redactar algo sobre el paciente —reporte de la cita, resumen, indicaciones postoperatorias— trabaja únicamente con lo que consta en la transcripción y en el expediente. Lo que no se dijo, no se escribe.
+Cuando te pidan redactar algo sobre el paciente —un reporte de la cita, un resumen, indicaciones postoperatorias— trabaja únicamente con lo que consta en la transcripción y en el expediente. Lo que no se dijo, no se escribe.
 
-Cuando te pregunten una duda clínica general, responde con lo que respalda la evidencia. Si un punto es controvertido o depende del caso, dilo.
+Cuando te pregunten una duda clínica general, responde con lo que respalda la evidencia. Si un punto es controvertido o depende del caso, dilo en lugar de dar una respuesta única.
 
-Si algo excede lo que puedes saber desde aquí —el estado real de un tejido, una radiografía que no viste— dilo con claridad. Un asistente que reconoce sus límites es más útil que uno que improvisa.
+Si te comparten una imagen —radiografía, fotografía intraoral, estudio— describe y analiza lo visible, señalando con claridad las limitaciones: una imagen no sustituye la exploración clínica y no siempre permite un diagnóstico definitivo.
+
+Si algo excede lo que puedes saber desde aquí —el estado real de un tejido, la respuesta de un paciente a un fármaco— dilo con claridad. Un asistente que reconoce sus límites es más útil que uno que improvisa.
 
 Distingue siempre entre lo que consta en el expediente y lo que es criterio general. Nunca presentes una inferencia tuya como si fuera un dato del paciente.
-
-Si te comparten una imagen —radiografía, fotografía clínica, estudio— descríbela con precisión y señala lo que observas, dejando claro que una interpretación diagnóstica definitiva corresponde al profesional que ve al paciente.
 
 La decisión clínica es del profesional. Tú aportas información y redacción.
 
@@ -107,11 +113,22 @@ export async function POST(request) {
       return NextResponse.json({ error: 'No hay mensajes.' }, { status: 400 });
     }
 
-    // Los mensajes pueden traer imágenes: se respeta el formato de bloques
-    const mensajesAPI = messages.map(m => ({
-      role: m.role,
-      content: Array.isArray(m.content) ? m.content : m.content
-    }));
+    // Los mensajes pueden traer imágenes adjuntas
+    const mensajesAPI = messages.map(m => {
+      if (m.images?.length) {
+        return {
+          role: m.role,
+          content: [
+            ...m.images.map(img => ({
+              type: 'image',
+              source: { type: 'base64', media_type: img.mediaType, data: img.data }
+            })),
+            { type: 'text', text: m.content || 'Analiza esta imagen.' }
+          ]
+        };
+      }
+      return { role: m.role, content: m.content };
+    });
 
     const response = await anthropic.messages.create({
       model: MODEL,

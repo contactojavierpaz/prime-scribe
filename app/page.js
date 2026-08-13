@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase, EHR_URL, audit } from '../lib/supabase';
-import { construirAlertas } from '../lib/alerts';
+import { buildAlerts } from '../lib/alerts';
 
 /* ══════════════════════════════════════════════════════════
    PRIME SCRIBE
@@ -64,25 +64,18 @@ export default function PrimeScribe() {
   const [mensajes, setMensajes] = useState([]);
   const [entrada, setEntrada] = useState('');
   const [pensando, setPensando] = useState(false);
-  const chatRef = useRef(null);
-
-  // Chat: imagen adjunta
-  const [imagenAdjunta, setImagenAdjunta] = useState(null); // {dataUrl, mediaType, base64, nombre}
-  const fileRef = useRef(null);
-
-  // Chat: dictado por micrófono
-  const [dictando, setDictando] = useState(false);
-  const [transcribiendoDictado, setTranscribiendoDictado] = useState(false);
-  const dictRecorder = useRef(null);
-  const dictChunks = useRef([]);
-  const dictStream = useRef(null);
-
-  // Chat: guardar conversación
+  const [imagenes, setImagenes] = useState([]);      // adjuntos pendientes
+  const [dictando, setDictando] = useState(false);   // micrófono del chat
+  const [transcribiendoChat, setTranscribiendoChat] = useState(false);
   const [guardandoChat, setGuardandoChat] = useState(false);
+  const chatRef = useRef(null);
+  const fileRef = useRef(null);
+  const chatRecorder = useRef(null);
+  const chatChunks = useRef([]);
+  const chatStream = useRef(null);
 
   // Notas previas
   const [notasPrevias, setNotasPrevias] = useState([]);
-
 
   /* ─── Sesión ─── */
   useEffect(() => {
@@ -311,160 +304,60 @@ export default function PrimeScribe() {
     setGuardando(false);
   }
 
-  /* ─── Imagen adjunta ─── */
-  function elegirImagen(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setAviso({ tipo: 'red', texto: 'El archivo debe ser una imagen.' });
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setAviso({ tipo: 'red', texto: 'La imagen excede 5 MB.' });
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result;
-      setImagenAdjunta({
-        data: dataUrl.split(',')[1],   // base64 sin el encabezado
-        type: file.type,
-        preview: dataUrl,
-        nombre: file.name
-      });
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
-  }
 
-  function quitarImagen() { setImagenAdjunta(null); }
+  /* ─── Imágenes adjuntas al chat ─── */
+  async function adjuntarImagenes(files) {
+    const lista = Array.from(files || []).filter(f => f.type.startsWith('image/'));
+    if (!lista.length) return;
 
-  /* ─── Dictado por voz ─── */
-  function alternarDictado() {
-    const SR = typeof window !== 'undefined' &&
-      (window.SpeechRecognition || window.webkitSpeechRecognition);
-    if (!SR) {
-      setAviso({ tipo: 'red', texto: 'El dictado no está disponible en este navegador. Usa Chrome o Safari.' });
-      return;
-    }
-    if (dictando) {
-      reconocimiento.current?.stop();
-      setDictando(false);
-      return;
-    }
-    const r = new SR();
-    r.lang = 'es-MX';
-    r.continuous = true;
-    r.interimResults = true;
-
-    let base = entrada;
-    r.onresult = ev => {
-      let texto = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        texto += ev.results[i][0].transcript;
+    const nuevas = [];
+    for (const file of lista.slice(0, 4)) {
+      if (file.size > 5 * 1024 * 1024) {
+        setAviso({ tipo: 'red', texto: `"${file.name}" excede 5 MB.` });
+        continue;
       }
-      setEntrada((base + ' ' + texto).trim());
-    };
-    r.onerror = () => setDictando(false);
-    r.onend = () => setDictando(false);
-
-    r.start();
-    reconocimiento.current = r;
-    setDictando(true);
-  }
-
-  /* ─── Chat clínico ─── */
-  async function enviarMensaje(texto) {
-    const contenido = (texto ?? entrada).trim();
-    if ((!contenido && !imagenAdjunta) || pensando) return;
-
-    // Con imagen se usa el formato de bloques de la API
-    const contenidoMensaje = imagenAdjunta
-      ? [
-          { type: 'image', source: { type: 'base64', media_type: imagenAdjunta.mediaType, data: imagenAdjunta.base64 } },
-          { type: 'text', text: contenido || 'Analiza esta imagen.' }
-        ]
-      : contenido;
-
-    const nuevos = [...mensajes, {
-      role: 'user',
-      content: contenidoMensaje,
-      _texto: contenido || 'Analiza esta imagen.',
-      _imagen: imagenAdjunta?.dataUrl || null
-    }];
-
-    setMensajes(nuevos);
-    setEntrada('');
-    setImagenAdjunta(null);
-    if (fileRef.current) fileRef.current.value = '';
-    setPensando(true);
-
-    try {
-      const r = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: nuevos.map(x => ({ role: x.role, content: x.content })),
-          patient: paciente,
-          transcript: transcripcion
-        })
+      const data = await new Promise(res => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result).split(',')[1]);
+        r.readAsDataURL(file);
       });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || 'Error en el chat');
-      setMensajes([...nuevos, { role: 'assistant', content: d.reply, _texto: d.reply }]);
-    } catch (e) {
-      setMensajes([...nuevos, { role: 'assistant', content: `No se pudo completar: ${e.message}`, _texto: `Error: ${e.message}` }]);
+      nuevas.push({
+        name: file.name,
+        mediaType: file.type === 'image/jpg' ? 'image/jpeg' : file.type,
+        data,
+        preview: `data:${file.type};base64,${data}`
+      });
     }
-    setPensando(false);
+    setImagenes(prev => [...prev, ...nuevas].slice(0, 4));
   }
 
-  /* ─── Imagen adjunta ─── */
-  async function adjuntarImagen(file) {
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setAviso({ tipo: 'red', texto: 'Solo se admiten imágenes.' });
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setAviso({ tipo: 'red', texto: 'La imagen supera 5 MB. Usa una versión más ligera.' });
-      return;
-    }
-    const dataUrl = await new Promise((res, rej) => {
-      const fr = new FileReader();
-      fr.onload = () => res(fr.result);
-      fr.onerror = rej;
-      fr.readAsDataURL(file);
-    });
-    setImagenAdjunta({
-      dataUrl,
-      mediaType: file.type,
-      base64: dataUrl.split(',')[1],
-      nombre: file.name
-    });
-    setAviso(null);
+  function quitarImagen(i) {
+    setImagenes(prev => prev.filter((_, idx) => idx !== i));
   }
 
   /* ─── Dictado por micrófono en el chat ─── */
   async function alternarDictado() {
     if (dictando) {
-      dictRecorder.current?.stop();
+      chatRecorder.current?.stop();
       setDictando(false);
       return;
     }
     try {
-      dictStream.current = await navigator.mediaDevices.getUserMedia({
+      chatStream.current = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
       });
       const opciones = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 24000 } : {};
-      const mr = new MediaRecorder(dictStream.current, opciones);
-      dictChunks.current = [];
-      mr.ondataavailable = e => { if (e.data.size > 0) dictChunks.current.push(e.data); };
+        ? { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 24000 }
+        : {};
+      const mr = new MediaRecorder(chatStream.current, opciones);
+      chatChunks.current = [];
+      mr.ondataavailable = e => { if (e.data.size > 0) chatChunks.current.push(e.data); };
       mr.onstop = async () => {
-        dictStream.current?.getTracks().forEach(t => t.stop());
-        const blob = new Blob(dictChunks.current, { type: mr.mimeType || 'audio/webm' });
+        chatStream.current?.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chatChunks.current, { type: mr.mimeType || 'audio/webm' });
         if (blob.size < 1000) return;
-        setTranscribiendoDictado(true);
+
+        setTranscribiendoChat(true);
         try {
           const fd = new FormData();
           fd.append('audio', blob, 'dictado.webm');
@@ -475,52 +368,49 @@ export default function PrimeScribe() {
         } catch (e) {
           setAviso({ tipo: 'red', texto: e.message });
         }
-        setTranscribiendoDictado(false);
+        setTranscribiendoChat(false);
       };
       mr.start();
-      dictRecorder.current = mr;
+      chatRecorder.current = mr;
       setDictando(true);
     } catch (e) {
       setAviso({ tipo: 'red', texto: 'No se pudo acceder al micrófono.' });
     }
   }
 
-  /* ─── Guardar la conversación como nota del expediente ─── */
-  async function guardarChatComoNota() {
-    if (!paciente || mensajes.length === 0) return;
-    if (!confirm('¿Guardar esta conversación como nota en el expediente del paciente?')) return;
+  /* ─── Guardar la conversación en el expediente ─── */
+  async function guardarChat() {
+    if (!paciente || !mensajes.length) return;
+    if (!confirm('¿Guardar esta conversación en el expediente del paciente?\n\nQuedará registrada como nota clínica con fecha y autor.')) return;
 
     setGuardandoChat(true);
     try {
-      const cuerpo = mensajes.map(m => {
-        const quien = m.role === 'user' ? (user?.email?.split('@')[0] || 'Profesional') : 'Asistente clínico';
-        const img = m._imagen ? ' [imagen adjunta]' : '';
-        return `${quien}:${img}\n${m._texto || ''}`;
-      }).join('\n\n');
+      const contenido = mensajes.map(m =>
+        `${m.role === 'user' ? '▸ CONSULTA' : '▸ RESPUESTA DEL ASISTENTE'}\n${m.content}${m.images?.length ? `\n[${m.images.length} imagen(es) adjunta(s)]` : ''}`
+      ).join('\n\n');
 
       const { data, error } = await supabase.from('clinical_notes').insert({
         patient_id:    paciente.id,
         record_number: paciente.record_number,
         note_type:     'chat',
         title:         'Consulta al asistente clínico',
-        content:       cuerpo,
+        content:       contenido,
         source:        'scribe_ai',
         ai_model:      'claude-sonnet-5',
         author_email:  user?.email,
         author_name:   user?.email?.split('@')[0] || null,
         author_role:   'doctor',
-        status:        'draft'
+        status:        'draft',
+        metadata:      { messages: mensajes.length, had_images: mensajes.some(m => m.images?.length) }
       }).select().single();
 
       if (error) throw error;
 
       await audit('NOTE_ADD', 'note', paciente.id, {
-        record_number: paciente.record_number,
-        entity_id: data.id,
-        note_type: 'chat'
+        record_number: paciente.record_number, entity_id: data.id, note_type: 'chat'
       });
 
-      setAviso({ tipo: 'green', texto: 'Conversación guardada como nota en el expediente.' });
+      setAviso({ tipo: 'green', texto: 'Conversación guardada en el expediente como nota clínica.' });
       cargarNotasPrevias(paciente.id);
     } catch (e) {
       setAviso({ tipo: 'red', texto: e.message });
@@ -528,45 +418,38 @@ export default function PrimeScribe() {
     setGuardandoChat(false);
   }
 
+  function limpiarChat() {
+    if (mensajes.length && !confirm('¿Descartar esta conversación sin guardarla?')) return;
+    setMensajes([]); setImagenes([]); setEntrada('');
+  }
 
-  /* ─── Guardar la conversación como nota del expediente ─── */
-  async function guardarChatComoNota() {
-    if (!paciente || !mensajes.length) return;
-    if (!confirm('¿Guardar esta conversación como nota en el expediente del paciente?')) return;
+  /* ─── Chat clínico ─── */
+  async function enviarMensaje(texto) {
+    const contenido = (texto ?? entrada).trim();
+    if ((!contenido && !imagenes.length) || pensando) return;
 
-    setGuardandoChat(true);
+    const adjuntos = imagenes.length ? imagenes.map(i => ({ mediaType: i.mediaType, data: i.data })) : null;
+    const nuevos = [...mensajes, {
+      role: 'user',
+      content: contenido || 'Analiza esta imagen.',
+      images: adjuntos,
+      previews: imagenes.map(i => i.preview)
+    }];
+    setMensajes(nuevos); setEntrada(''); setImagenes([]); setPensando(true);
+
     try {
-      const cuerpo = mensajes.map(m =>
-        `${m.role === 'user' ? '— Consulta del profesional —' : '— Respuesta del asistente —'}\n${m.content}${m.preview ? '\n[Se adjuntó una imagen]' : ''}`
-      ).join('\n\n');
-
-      const { data, error } = await supabase.from('clinical_notes').insert({
-        patient_id:    paciente.id,
-        record_number: paciente.record_number,
-        note_type:     'evolution',
-        title:         'Consulta al asistente clínico',
-        content:       cuerpo,
-        source:        'scribe_ai',
-        ai_model:      'claude-sonnet-5',
-        author_email:  user?.email,
-        author_name:   user?.email?.split('@')[0] || null,
-        author_role:   'doctor',
-        status:        'draft',
-        metadata:      { origin: 'chat_clinico', messages: mensajes.length }
-      }).select().single();
-
-      if (error) throw error;
-
-      await audit('NOTE_ADD', 'note', paciente.id, {
-        record_number: paciente.record_number, entity_id: data.id, origin: 'chat_clinico'
+      const r = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: nuevos, patient: paciente, transcript: transcripcion })
       });
-
-      setAviso({ tipo: 'green', texto: 'Conversación guardada como borrador en el expediente. Revísala antes de firmarla.' });
-      cargarNotasPrevias(paciente.id);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Error en el chat');
+      setMensajes([...nuevos, { role: 'assistant', content: d.reply }]);
     } catch (e) {
-      setAviso({ tipo: 'red', texto: e.message });
+      setMensajes([...nuevos, { role: 'assistant', content: `No se pudo completar: ${e.message}` }]);
     }
-    setGuardandoChat(false);
+    setPensando(false);
   }
 
   useEffect(() => {
@@ -658,7 +541,7 @@ export default function PrimeScribe() {
   }
 
   /* ══════════ APLICACIÓN ══════════ */
-  const alertas = construirAlertas(paciente);
+  const alertas = buildAlerts(paciente);
 
   return (
     <>
@@ -681,20 +564,22 @@ export default function PrimeScribe() {
           {alertas.length > 0 && (
             <div style={{ marginBottom: '.75rem' }}>
               {alertas.map((a, i) => (
-                <div key={i} className={`alert alert-${a.nivel === 'roja' ? 'red' : 'gold'}`}
-                     style={{ marginBottom: 6 }}>
-                  <span>{a.nivel === 'roja' ? '⛔' : '⚠️'}</span>
-                  <span>{a.texto}</span>
+                <div key={i} className={`alert alert-${a.t === 'red' ? 'red' : 'gold'}`} style={{ marginBottom: 6 }}>
+                  <span>{a.t === 'red' ? '⛔' : '⚠️'}</span>
+                  <span><strong>{a.t === 'red' ? 'ALERTA CRÍTICA:' : 'ALERTA:'}</strong> {a.m}</span>
                 </div>
               ))}
             </div>
           )}
 
           {(paciente.allergies || paciente.conditions || paciente.meds) && (
-            <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: '.75rem', lineHeight: 1.7 }}>
-              {paciente.allergies  && <><strong>Alergias:</strong> {paciente.allergies}<br /></>}
-              {paciente.conditions && <><strong>Padecimientos:</strong> {paciente.conditions}<br /></>}
-              {paciente.meds       && <><strong>Medicación:</strong> {paciente.meds}</>}
+            <div className="alert alert-gold" style={{ marginBottom: '.75rem' }}>
+              <span>📋</span>
+              <span>
+                {paciente.allergies  && <><strong>Alergias:</strong> {paciente.allergies}<br /></>}
+                {paciente.conditions && <><strong>Padecimientos:</strong> {paciente.conditions}<br /></>}
+                {paciente.meds       && <><strong>Medicación:</strong> {paciente.meds}</>}
+              </span>
             </div>
           )}
 
@@ -846,26 +731,24 @@ export default function PrimeScribe() {
               <div>
                 <div className="h2" style={{ fontSize: 18 }}>Chat clínico</div>
                 <div className="sub">
-                  Consulta dudas o pide trabajo sobre este paciente.
+                  Consulta dudas médicas o pide trabajo sobre este paciente.
                   {transcripcion && ' La consulta grabada está disponible como contexto.'}
                 </div>
               </div>
               {mensajes.length > 0 && (
-                <button className="btn btn-ghost btn-sm" onClick={guardarChatComoNota} disabled={guardandoChat}>
-                  {guardandoChat ? <><span className="spinner" /> Guardando...</> : '💾 Guardar como nota'}
-                </button>
+                <div className="row" style={{ gap: 6 }}>
+                  <button className="btn btn-ghost btn-sm" onClick={limpiarChat}>Descartar</button>
+                  <button className="btn btn-gold btn-sm" onClick={guardarChat} disabled={guardandoChat}>
+                    {guardandoChat ? <><span className="spinner" /> Guardando...</> : '💾 Guardar en expediente'}
+                  </button>
+                </div>
               )}
             </div>
 
-            {alertas.length > 0 && (
-              <div className={`alert alert-${alertas.some(a => a.nivel === 'roja') ? 'red' : 'gold'}`}>
-                <span>{alertas.some(a => a.nivel === 'roja') ? '⛔' : '⚠️'}</span>
-                <span>
-                  <strong>El asistente tiene presentes estas alertas:</strong><br />
-                  {alertas.map((a, i) => (
-                    <span key={i}>{a.nivel === 'roja' ? '⛔' : '⚠️'} {a.texto}<br /></span>
-                  ))}
-                </span>
+            {alertas.some(a => a.t === 'red') && (
+              <div className="alert alert-red">
+                <span>⛔</span>
+                <span>Este paciente tiene alertas críticas. El asistente las considera en sus respuestas.</span>
               </div>
             )}
 
@@ -879,16 +762,21 @@ export default function PrimeScribe() {
 
             <div className="chat-log" ref={chatRef}>
               {mensajes.length === 0 && (
-                <div className="empty">Escribe una pregunta, dicta con el micrófono o adjunta una imagen.</div>
+                <div className="empty">
+                  Escribe una pregunta, dicta con el micrófono o adjunta una radiografía.
+                </div>
               )}
               {mensajes.map((m, i) => (
                 <div key={i} className={`msg ${m.role}`}>
                   <div className="msg-bubble">
-                    {m._imagen && (
-                      <img src={m._imagen} alt="Imagen adjunta"
-                        style={{ maxWidth: '100%', borderRadius: 'var(--r)', marginBottom: 8, display: 'block' }} />
+                    {m.previews?.length > 0 && (
+                      <div className="msg-images">
+                        {m.previews.map((src, j) => (
+                          <img key={j} src={src} alt="Adjunto" className="msg-image" />
+                        ))}
+                      </div>
                     )}
-                    {m._texto || (typeof m.content === 'string' ? m.content : '')}
+                    {m.content}
                   </div>
                 </div>
               ))}
@@ -899,36 +787,26 @@ export default function PrimeScribe() {
               )}
             </div>
 
-            {imagenAdjunta && (
-              <div className="alert alert-gold" style={{ alignItems: 'center' }}>
-                <img src={imagenAdjunta.dataUrl} alt=""
-                  style={{ width: 44, height: 44, objectFit: 'cover', borderRadius: 'var(--r)', flexShrink: 0 }} />
-                <span className="grow" style={{ fontSize: 12 }}>{imagenAdjunta.nombre}</span>
-                <button className="btn btn-ghost btn-sm" onClick={() => {
-                  setImagenAdjunta(null);
-                  if (fileRef.current) fileRef.current.value = '';
-                }}>Quitar</button>
+            {imagenes.length > 0 && (
+              <div className="attach-row">
+                {imagenes.map((img, i) => (
+                  <div key={i} className="attach-thumb">
+                    <img src={img.preview} alt={img.name} />
+                    <button className="attach-x" onClick={() => quitarImagen(i)} aria-label="Quitar">×</button>
+                  </div>
+                ))}
               </div>
             )}
 
-            <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }}
-              onChange={e => adjuntarImagen(e.target.files?.[0])} />
-
             <div className="chat-input-row">
-              <button className="btn btn-ghost" onClick={() => fileRef.current?.click()}
-                title="Adjuntar imagen" style={{ padding: '11px 13px' }}>
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
-                </svg>
-              </button>
-
-              <button className={`btn ${dictando ? 'btn-danger' : 'btn-ghost'}`}
-                onClick={alternarDictado} disabled={transcribiendoDictado}
-                title={dictando ? 'Detener dictado' : 'Dictar con micrófono'}
-                style={{ padding: '11px 13px' }}>
-                {transcribiendoDictado ? <span className="spinner" /> : dictando ? (
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
-                ) : (
+              <button
+                className={`btn ${dictando ? 'btn-danger' : 'btn-ghost'}`}
+                onClick={alternarDictado}
+                disabled={transcribiendoChat}
+                title={dictando ? 'Detener dictado' : 'Dictar con el micrófono'}
+                style={{ padding: '11px 13px', flexShrink: 0 }}
+              >
+                {transcribiendoChat ? <span className="spinner" /> : dictando ? '■' : (
                   <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3z" />
                     <path d="M19 10v1a7 7 0 01-14 0v-1" /><line x1="12" y1="18" x2="12" y2="22" />
@@ -936,16 +814,30 @@ export default function PrimeScribe() {
                 )}
               </button>
 
+              <button
+                className="btn btn-ghost"
+                onClick={() => fileRef.current?.click()}
+                title="Adjuntar imagen o radiografía"
+                style={{ padding: '11px 13px', flexShrink: 0 }}
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+                </svg>
+              </button>
+
+              <input ref={fileRef} type="file" accept="image/*" multiple hidden
+                onChange={e => { adjuntarImagenes(e.target.files); e.target.value = ''; }} />
+
               <textarea rows={2}
                 value={entrada}
-                placeholder={dictando ? 'Escuchando...' : transcribiendoDictado ? 'Transcribiendo...' : 'Escribe tu pregunta...'}
+                placeholder={dictando ? 'Escuchando...' : 'Escribe tu pregunta...'}
                 onChange={e => setEntrada(e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); enviarMensaje(); }
                 }} />
 
               <button className="btn btn-gold" onClick={() => enviarMensaje()}
-                disabled={pensando || (!entrada.trim() && !imagenAdjunta)}>
+                disabled={pensando || (!entrada.trim() && !imagenes.length)}>
                 Enviar
               </button>
             </div>

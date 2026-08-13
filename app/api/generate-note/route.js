@@ -1,17 +1,15 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { NextResponse } from 'next/server';
-import { construirAlertas, alertasComoTexto } from '../../../lib/alerts';
+import { buildAlerts, alertsToPrompt } from '../../../lib/alerts';
+import { alertsForPrompt } from '../../../lib/alerts';
 
 /**
  * Redacción de nota clínica a partir de la transcripción.
  *
- * Principio rector: el modelo redacta únicamente sobre lo que consta en
- * la transcripción. No infiere diagnósticos ni completa datos faltantes.
- *
- * Los apartados que no se abordaron durante la consulta se omiten por
- * completo — no se escriben con leyendas de ausencia. Una nota clínica
- * debe leerse como la escribiría un profesional, no como un formulario
- * con huecos.
+ * Principio rector: el modelo redacta únicamente sobre lo que consta
+ * en la transcripción. No infiere diagnósticos, no completa datos
+ * faltantes y no inventa hallazgos. Un apartado que no se abordó
+ * simplemente se omite: no se rellena con texto de marcador.
  */
 
 export const maxDuration = 120;
@@ -57,13 +55,20 @@ const PLANTILLAS = {
   },
   evolution: {
     nombre: 'Nota de evolución',
-    estructura: ['ESTADO ACTUAL', 'HALLAZGOS', 'ANÁLISIS', 'CONDUCTA A SEGUIR']
+    estructura: [
+      'ESTADO ACTUAL',
+      'HALLAZGOS',
+      'ANÁLISIS',
+      'CONDUCTA A SEGUIR'
+    ]
   }
 };
 
 function construirSystem(paciente, plantilla) {
   const p = paciente || {};
-  const alertas = construirAlertas(p);
+  const t = PLANTILLAS[plantilla] || PLANTILLAS.consultation;
+
+  const alertas = alertsToPrompt(buildAlerts(p));
 
   const contexto = [
     p.name          ? `Paciente: ${p.name}` : null,
@@ -73,46 +78,54 @@ function construirSystem(paciente, plantilla) {
     p.allergies     ? `Alergias declaradas: ${p.allergies}` : null,
     p.conditions    ? `Padecimientos declarados: ${p.conditions}` : null,
     p.meds          ? `Medicación actual: ${p.meds}` : null,
-    p.pregnant      ? 'Embarazo declarado: SÍ' : null,
+    p.pregnant      ? 'Embarazo o lactancia: SÍ' : null,
     p.smoke         ? `Tabaquismo: ${typeof p.smoke === 'string' ? p.smoke : 'sí'}` : null,
     p.doctor_plan   ? `Plan de tratamiento vigente: ${p.doctor_plan}` : null
   ].filter(Boolean).join('\n');
-
-  const t = PLANTILLAS[plantilla] || PLANTILLAS.consultation;
-
-  const bloqueAlertas = alertas.length
-    ? `\nALERTAS CLÍNICAS DEL EXPEDIENTE\n${alertasComoTexto(alertas)}\n\nSi durante la consulta se abordó algún tema que estas alertas condicionan —fármacos, anestesia, radiografías, plan quirúrgico— consígnalo en la nota. No inventes que se discutieron si no fue así.\n`
-    : '';
 
   return `Eres asistente de documentación clínica en Prime Advanced Dentistry, clínica de implantología y rehabilitación oral en Cancún, México.
 
 Tu tarea es redactar una nota clínica a partir de la transcripción de una consulta.
 
+=========================================================
+ALERTAS MÉDICAS DE ESTE PACIENTE
+=========================================================
+${alertas}
+=========================================================
+
 CONTEXTO DEL PACIENTE
 ${contexto || 'Sin contexto previo disponible.'}
-${bloqueAlertas}
+
 ESTRUCTURA DE REFERENCIA — "${t.nombre}"
 ${t.estructura.map(s => `## ${s}`).join('\n')}
 
-CÓMO USAR LA ESTRUCTURA
-
-Incluye únicamente los apartados que se abordaron durante la consulta.
-
-Si un apartado no se trató, omítelo por completo: no escribas el encabezado, no escribas "no consignado", no escribas "sin datos" ni ninguna leyenda equivalente. Simplemente no aparece en la nota.
-
-Una nota con tres apartados bien documentados es mejor que una con siete, cuatro de ellos vacíos. La nota debe leerse como la escribiría un profesional, no como un formulario con huecos.
-
+=========================================================
 REGLAS DE REDACCIÓN
+=========================================================
 
-Redacta únicamente sobre lo que consta en la transcripción. No infieras diagnósticos, no completes datos que no se dijeron y no agregues hallazgos que no se mencionaron. Una nota clínica es un documento legal: lo que escribes debe poder sostenerse frente a lo grabado.
+QUÉ INCLUIR Y QUÉ NO
 
-El contexto del paciente sirve para interpretar correctamente lo que oyes —por ejemplo, reconocer el nombre de un fármaco que ya toma— no para rellenar la nota con información que no se trató en esta consulta.
+Redacta únicamente sobre lo que consta en la transcripción.
+
+Si un apartado de la estructura no fue abordado durante la consulta, OMÍTELO POR COMPLETO. No lo incluyas con un texto de relleno, no escribas "no consignado", "no se mencionó", "sin datos" ni ninguna variante. Simplemente no aparece en la nota. La estructura es una guía, no una plantilla que deba llenarse entera.
+
+Una nota corta que refleje fielmente lo que ocurrió es mejor que una nota larga con apartados vacíos.
+
+No infieras diagnósticos, no completes datos que no se dijeron y no agregues hallazgos que no se mencionaron. Una nota clínica es un documento legal: lo que escribes debe poder sostenerse frente a lo grabado.
+
+El contexto del paciente y sus alertas sirven para interpretar correctamente lo que oyes —por ejemplo, reconocer el nombre de un fármaco que ya toma— no para rellenar la nota con información que no se trató en la consulta.
+
+SOBRE LAS ALERTAS
+
+Si durante la consulta se discutió un tema que interactúa con una alerta médica —un procedimiento en una paciente embarazada, anestesia en un paciente anticoagulado— consigna esa parte de la conversación con precisión.
+
+Si detectas que se planeó algo que contradice una alerta roja y eso no se discutió en la consulta, agrégalo al final bajo "## OBSERVACIONES PARA REVISIÓN". No lo mezcles con el cuerpo de la nota: es una observación tuya, no un asiento de lo ocurrido.
+
+ESTILO
 
 Usa terminología odontológica precisa y español clínico formal. Redacta en tercera persona.
 
 Si en la transcripción se mencionan cifras relevantes —torque, milímetros, dosis, número de órgano dentario— consígnalas textualmente.
-
-Si detectas algo clínicamente relevante que quedó ambiguo en la transcripción, agrégalo al final bajo "## OBSERVACIONES PARA REVISIÓN" en lugar de interpretarlo por tu cuenta.
 
 Responde solo con la nota. Sin preámbulos ni comentarios sobre tu trabajo.`;
 }
@@ -146,9 +159,16 @@ export async function POST(request) {
       messages: [{ role: 'user', content: mensaje }]
     });
 
-    const note = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    const note = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
 
-    return NextResponse.json({ note, model: MODEL, template: template || 'consultation' });
+    return NextResponse.json({
+      note,
+      model: MODEL,
+      template: template || 'consultation'
+    });
 
   } catch (error) {
     console.error('[generate-note]', error);
