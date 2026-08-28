@@ -73,6 +73,7 @@ function construirSystem(paciente, plantilla) {
   const contexto = [
     p.name          ? `Paciente: ${p.name}` : null,
     p.age           ? `Edad: ${p.age} años` : null,
+    p.sex           ? `Sexo: ${({male:'Masculino',female:'Femenino',other:'Otro/No especificado'})[p.sex] || p.sex}` : null,
     p.record_number ? `Expediente: ${p.record_number}` : null,
     p.concern       ? `Motivo registrado en su historia clínica: ${p.concern}` : null,
     p.allergies     ? `Alergias declaradas: ${p.allergies}` : null,
